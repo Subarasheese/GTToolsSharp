@@ -290,7 +290,9 @@ class Program
             return;
         }
 
-        using var vol = GTVolumeMPH.Load(options.InputPath);
+        Program.SaveHeader = options.SaveVolumeHeader;
+
+        using var vol = GTVolumeMPH.Load(options.InputPath, options.PS5ExecutablePath);
         if (vol == null)
         {
             Console.WriteLine($"[X] Could not unpack volume.");
@@ -298,7 +300,6 @@ class Program
         }
 
         Program.Log("[-] Started unpacking process.", forceConsolePrint: true);
-        Program.SaveHeader = options.SaveVolumeHeader;
 
         if (string.IsNullOrEmpty(options.OutputPath))
             options.OutputPath = Path.Combine(Path.GetDirectoryName(options.InputPath), "Unpacked");

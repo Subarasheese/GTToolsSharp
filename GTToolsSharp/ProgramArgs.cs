@@ -74,6 +74,9 @@ public class GT7UnpackVerbs
     [Option("save-volume-header", HelpText = "Decrypts and saves the volume header (as VolumeHeader.bin)")]
     public bool SaveVolumeHeader { get; set; }
 
+    [Option("elf", HelpText = "PS5: decrypted game executable (eboot.bin as ELF) to read the index key from. Defaults to eboot.elf/eboot.bin next to the contents folder.")]
+    public string PS5ExecutablePath { get; set; }
+
     [Usage(ApplicationAlias = "GTToolsSharp")]
     public static IEnumerable<Example> Examples
     {

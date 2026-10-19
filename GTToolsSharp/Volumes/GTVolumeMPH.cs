@@ -15,6 +15,8 @@ using PDTools.Crypto;
 using PDTools.Hashing;
 using GTToolsSharp.Encryption;
 
+using PDTools.Compression;
+
 namespace GTToolsSharp.Volumes;
 
 /// <summary>
@@ -58,16 +60,25 @@ public class GTVolumeMPH : IDisposable
     }
 
     /// <summary>
+    /// Folder holding the index. On PS5, node files are stored under it (contents/X/Y/NAME).
+    /// </summary>
+    public string ContentsDirectory { get; private set; }
+
+    public bool IsPS5 => VolumeHeader is FileDeviceMPHSuperintendentHeaderPS5;
+
+    /// <summary>
     /// Loads a volume file.
     /// </summary>
-    /// <param name="path"></param>
-    /// <param name="isPatchVolume"></param>
-    /// <param name="endianness"></param>
+    /// <param name="path">Index file (gt.idx).</param>
+    /// <param name="ps5ExecutablePath">PS5 only: decrypted game executable to read the index key from.
+    /// If not provided, eboot.bin/eboot.elf next to the contents folder is tried.</param>
     /// <returns></returns>
-    public static GTVolumeMPH Load(string path)
+    public static GTVolumeMPH Load(string path, string ps5ExecutablePath = null)
     {
-        FileStream fs = new FileStream(path, FileMode.Open);
+        FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read);
         GTVolumeMPH vol = new GTVolumeMPH(fs);
+        vol.InputPath = path;
+        vol.ContentsDirectory = Path.GetDirectoryName(Path.GetFullPath(path));
 
         byte[] headerMagic = new byte[4];
         fs.ReadExactly(headerMagic);
@@ -81,9 +92,19 @@ public class GTVolumeMPH : IDisposable
             var tmpData = new byte[fs.Length];
             fs.Position = 0;
             fs.ReadExactly(tmpData);
+
+            if (GT7PS5IndexCrypto.IsDecryptedHeader(tmpData))
+            {
+                Program.Log("[:] Index is a decrypted PS5 index.");
+                return vol.LoadPS5(tmpData) ? vol : null;
+            }
+
+            byte[] encrypted = (byte[])tmpData.Clone();
             DecryptHeader(tmpData);
 
             headerType = MPHVolumeHeaderBase.Detect(tmpData);
+            if (headerType == MPHVolumeHeaderType.Unknown)
+                return vol.TryLoadEncryptedPS5(encrypted, ps5ExecutablePath) ? vol : null;
         }
 
         if (headerType == MPHVolumeHeaderType.Unknown)
@@ -94,7 +115,6 @@ public class GTVolumeMPH : IDisposable
         }
 
         fs.Position = 0;
-        vol.InputPath = path;
         vol.VolumeHeader = MPHVolumeHeaderBase.Load(fs, vol, headerType, out byte[] headerBytes);
         vol.VolumeHeaderData = headerBytes;
 
@@ -108,6 +128,75 @@ public class GTVolumeMPH : IDisposable
         vol.LoadSplitVolumesIfNeeded();
 
         return vol;
+    }
+
+    private bool TryLoadEncryptedPS5(byte[] encrypted, string executablePath)
+    {
+        executablePath ??= FindPS5Executable(ContentsDirectory);
+        if (executablePath is null)
+        {
+            Program.Log("[X] Failed to decrypt volume or volume is not a GT7 MPH volume. " +
+                "If this is a GT7 PS5 index, provide the decrypted game executable (--elf) to read the index key from.", forceConsolePrint: true);
+            Dispose();
+            return false;
+        }
+
+        Program.Log($"[-] Reading the PS5 index key from '{executablePath}'..", forceConsolePrint: true);
+        byte[] key = GT7PS5IndexKeyExtractor.FindIndexKey(executablePath, encrypted, out string error);
+        if (key is null)
+        {
+            Program.Log($"[X] {error}", forceConsolePrint: true);
+            Dispose();
+            return false;
+        }
+
+        GT7PS5IndexCrypto.Decrypt(encrypted, key);
+        return LoadPS5(encrypted);
+    }
+
+    private bool LoadPS5(byte[] decrypted)
+    {
+        var header = new FileDeviceMPHSuperintendentHeaderPS5();
+        header.Read(decrypted);
+
+        VolumeHeader = header;
+        VolumeHeaderData = decrypted;
+        SplitVolumes = [];
+
+        if (Program.SaveHeader)
+        {
+            File.WriteAllBytes("VolumeHeader.bin", VolumeHeaderData);
+            Program.Log("Saved decrypted header as VolumeHeader.bin", forceConsolePrint: true);
+        }
+
+        VolumeHeader.PrintInfo();
+        return true;
+    }
+
+    /// <summary>
+    /// Looks for a decrypted executable next to the contents folder (app0/eboot.bin, app0/contents/gt.idx).
+    /// </summary>
+    private static string FindPS5Executable(string contentsDirectory)
+    {
+        string appDirectory = Path.GetDirectoryName(contentsDirectory);
+        if (appDirectory is null)
+            return null;
+
+        foreach (var name in new[] { "eboot.elf", "eboot.bin" })
+        {
+            string candidate = Path.Combine(appDirectory, name);
+            if (!File.Exists(candidate))
+                continue;
+
+            using var stream = File.OpenRead(candidate);
+            Span<byte> magic = stackalloc byte[4];
+            if (stream.Read(magic) == 4 && magic.SequenceEqual("\u007FELF"u8))
+                return candidate;
+
+            Program.Log($"[!] '{candidate}' is not a decrypted executable (ELF), skipping it.");
+        }
+
+        return null;
     }
 
     // vol01: piece, 
@@ -129,17 +218,31 @@ public class GTVolumeMPH : IDisposable
 
         Program.Log($"[!] Mapped {gameFiles.Count}/{h.Nodes.Length} files from hashed volume.");
 
+        Dictionary<MPHNodeInfo, string> pathByNode = [];
+        foreach (var (path, node) in gameFiles)
+            pathByNode.TryAdd(node, path);
+
         // await ParallelExtractFiles(outputDirectory, h, gameFiles);
         for (int i = 0; i < h.Nodes.Length; i++)
         {
             MPHNodeInfo file = h.Nodes[i];
+
+            if (IsPS5)
+            {
+                if (pathByNode.TryGetValue(file, out string ps5Path))
+                    UnpackPS5File(file, Path.Combine(outputDirectory, ps5Path), ps5Path, -1);
+                else
+                    UnpackPS5File(file, Path.Combine(outputDirectory, ".undiscovered", $"tmp{i}"), string.Empty, i); // Will be renamed by extension detect
+
+                continue;
+            }
+
             ClusterVolume clusterVolume = file.IsFromClusterVolume() ? SplitVolumes[file.GetVolumeIndex()] : null;
 
             string outPath;
             string volPath;
-            if (gameFiles.ContainsValue(file))
+            if (pathByNode.TryGetValue(file, out volPath))
             {
-                volPath = gameFiles.FirstOrDefault(e => e.Value == file).Key;
                 outPath = Path.Combine(outputDirectory, volPath);
             }
             else
@@ -166,7 +269,7 @@ public class GTVolumeMPH : IDisposable
             }
             else if (file.IsFromPFSStyleFile())
             {
-                throw new NotImplementedException("PFS Style file not implemented (PS5 volume?)");
+                throw new NotImplementedException("PFS Style file not implemented (PS4)");
             }
         }
     }
@@ -179,17 +282,104 @@ public class GTVolumeMPH : IDisposable
         if (node is null)
             return false;
 
-        if (node.IsFromClusterVolume())
+        if (IsPS5)
+        {
+            return UnpackPS5File(node, Path.Combine(outputDirectory, path), path, -1);
+        }
+        else if (node.IsFromClusterVolume())
         {
             ClusterVolume vol = SplitVolumes[node.GetVolumeIndex()];
             vol.UnpackFile(node, Path.Combine(outputDirectory, path), path, -1);
         }
         else if (node.IsFromPFSStyleFile())
         {
-            throw new NotImplementedException("PFS not implemented (PS5 volume?)");
+            throw new NotImplementedException("PFS Style file not implemented (PS4)");
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Gets the path of a PS5 node's file in the contents folder.
+    /// </summary>
+    public string GetPS5FilePath(MPHNodeInfo node)
+    {
+        return Path.Combine(ContentsDirectory, GetCacheKey(node.FileSeed));
+    }
+
+    /// <summary>
+    /// Extracts a PS5 node. Files are stored unencrypted in the contents folder, some compressed (PS2ZIP).
+    /// </summary>
+    /// <param name="nodeIndex">If not -1, the output is renamed from its detected file type (undiscovered files).</param>
+    private bool UnpackPS5File(MPHNodeInfo node, string outputPath, string volPath, int nodeIndex)
+    {
+        string sourcePath = GetPS5FilePath(node);
+        string cacheKey = GetCacheKey(node.FileSeed);
+
+        if (!File.Exists(sourcePath))
+        {
+            Program.Log($"[!] Missing contents file '{cacheKey}' for {(string.IsNullOrEmpty(volPath) ? $"node {node.NodeIndex} ({node.EntryHash:X8})" : volPath)}, skipping");
+            return false;
+        }
+
+        if (!string.IsNullOrEmpty(volPath))
+            Program.Log($"[-] Unpacking: {volPath} ({cacheKey}{(node.IsCompressed ? ", compressed" : "")})");
+        else
+            Program.Log($"[-] Unpacking undiscovered file: {node.EntryHash:X8} ({cacheKey}{(node.IsCompressed ? ", compressed" : "")})");
+
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outputPath)));
+
+        bool success;
+        using (FileStream input = File.OpenRead(sourcePath))
+        using (FileStream output = new FileStream(outputPath, FileMode.Create))
+        {
+            if ((ulong)input.Length != node.CompressedSize)
+                Program.Log($"[!] Contents file '{cacheKey}' is 0x{input.Length:X} bytes, index says 0x{node.CompressedSize:X}");
+
+            if (node.IsCompressed)
+            {
+                success = PS2ZIP.TryInflate(input, output);
+                if (!success)
+                    Program.Log($"[X] Failed to decompress '{cacheKey}'");
+            }
+            else
+            {
+                input.CopyTo(output);
+                success = true;
+            }
+        }
+
+        if (success && nodeIndex != -1)
+        {
+            string ext = DetectExtension(outputPath);
+            File.Move(outputPath, Path.Combine(Path.GetDirectoryName(outputPath), $"{nodeIndex}_{node.EntryHash:X8}.{ext}"), overwrite: true);
+        }
+
+        return success;
+    }
+
+    private static string DetectExtension(string path)
+    {
+        using FileStream stream = File.OpenRead(path);
+        if (stream.Length < 4)
+            return "bin";
+
+        uint magic = ClusterVolume.GetMagic(stream, out string asciiMagic);
+        return magic switch
+        {
+            0xe0ffd8ff => "jpg",
+            0xE1FFD8FF => "jpg",
+            0x200A0D7B => "json",
+            0x6d783f3c => "xml",
+            0x474e5089 => "png",
+            PS2ZIP.PS2ZIP_MAGIC => "pz",
+            _ => asciiMagic switch
+            {
+                null or "" => "bin",
+                "ADCH" => "adc",
+                _ => asciiMagic,
+            },
+        };
     }
 
     public MPHNodeInfo CheckFile(SortedDictionary<string, MPHNodeInfo> validFiles, string path)

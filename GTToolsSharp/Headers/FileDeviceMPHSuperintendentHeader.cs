@@ -6,6 +6,8 @@ using System.Threading.Tasks;
 
 using PDTools.Utils;
 
+using Syroot.BinaryData.Memory;
+
 using GTToolsSharp.Entities;
 
 namespace GTToolsSharp.Headers;
@@ -223,6 +225,55 @@ public class IndexerMPH
         GValues = new byte[GValueCount];
         for (var i = 0; i < GValues.Length; i++)
             GValues[i] = bs.ReadByte();
+    }
+
+    /// <summary>
+    /// Reads a GT7 PS5 indexer (little endian). The PS5 format does not store the rank tables
+    /// (ExistsACM256/ExistsACM32), they are rebuilt from the exists bitmap.
+    /// </summary>
+    public void ReadPS5(ref SpanReader sr)
+    {
+        NodeCount = sr.ReadInt32();
+
+        ExistsCount = sr.ReadUInt64();
+        Exists = new int[ExistsCount];
+        for (var i = 0; i < Exists.Length; i++)
+            Exists[i] = sr.ReadInt32();
+
+        VertexCount = sr.ReadUInt32();
+        for (var i = 0; i < Seeds.Length; i++)
+            Seeds[i] = sr.ReadUInt32();
+
+        GValueCount = sr.ReadUInt64();
+        GValues = sr.ReadBytes((int)GValueCount);
+
+        BuildRankTables();
+    }
+
+    private void BuildRankTables()
+    {
+        ExistsACM256Count = (ExistsCount + 7) / 8;
+        ExistsACM256 = new int[ExistsACM256Count];
+        ExistsACM32Count = ExistsCount;
+        ExistsACM32 = new byte[ExistsACM32Count];
+
+        int total = 0, inBlock = 0;
+        for (var i = 0; i < Exists.Length; i++)
+        {
+            if (i % 8 == 0)
+            {
+                ExistsACM256[i / 8] = total;
+                inBlock = 0;
+            }
+
+            ExistsACM32[i] = (byte)inBlock;
+            int count = System.Numerics.BitOperations.PopCount((uint)Exists[i]);
+            total += count;
+            inBlock += count;
+        }
+
+        if (total != NodeCount)
+            Program.Log($"[!] Indexer exists bitmap has {total} entries, expected {NodeCount}");
     }
 
     /***************************************
